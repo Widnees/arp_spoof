@@ -4,13 +4,14 @@ A Linux command-line ARP spoofing demonstration written in Rust for isolated, au
 
 The application discovers IPv4 devices using ARP and sends forged ARP replies between discovered devices and the default gateway. This can redirect traffic to the local machine and interrupt connectivity. On Ctrl+C, it attempts to restore the original ARP mappings.
 
-> Run only in an isolated lab where you have explicit authorization for every affected device and the gateway. The program starts automatically and has no target selector or dry-run mode.
+> Run only in an isolated lab where you have explicit authorization for every affected device and the gateway. At startup the program asks which devices to affect; there is no dry-run mode, so confirm scope before continuing.
 
 ## Features
 
 - Automatic selection of an active IPv4 interface and detection of a default gateway.
 - Gateway MAC address resolution through ARP.
 - Initial discovery followed by periodic background scans.
+- Interactive attack-mode selection: one or more selected targets, everyone, or everyone except one or more protected devices. The target picker keeps scanning in the background, refreshes automatically, and lets you move through the list with the arrow keys (or `j`/`k`), toggle devices with Space, and confirm with Enter.
 - Separate threads for receiving ARP replies, sending forged replies, scanning, and displaying status.
 - Live device count, packet attempt count, background scan count, elapsed time, and IPv4 forwarding status.
 - Best-effort ARP restoration when stopped with Ctrl+C.
@@ -42,31 +43,32 @@ Before starting, isolate the test network, confirm that all attached devices are
 sudo ./target/release/arp_spoof
 ```
 
-There are no command-line options. Starting the executable immediately begins network detection and discovery, followed by spoofing of discovered devices. Do not rely on `--help` or other arguments to prevent execution: arguments are not parsed.
+There are no command-line options. Starting the executable begins network detection and discovery, then prompts for an attack mode: one or more selected targets, everyone, or everyone except one or more protected devices. In the target picker, move the highlight with the arrow keys (or `j`/`k`), press Space to select or deselect the highlighted device, and press Enter to confirm the selection. `c` clears the selection and `q` cancels. The list keeps refreshing while it is open, and the highlight and selection follow devices by MAC address. Do not rely on `--help` or other arguments to prevent execution: arguments are not parsed.
 
 Press **Ctrl+C** to request shutdown and attempt ARP restoration. The background scanner sleeps between scans, so the process may take approximately 15 seconds to finish exiting. Restoration is best effort; verify connectivity independently afterward.
 
-The application reports the system's IPv4 forwarding setting but does not modify it. Disabled forwarding can cause loss of connectivity when traffic is redirected to this machine. Enabled forwarding alone does not guarantee connectivity: routing, firewall rules, and network protections also matter.
+The application turns IPv4 and IPv6 forwarding off when it starts if they are enabled, and restores the previous values on exit: forwarding would make the redirected traffic a man-in-the-middle path instead of a cut. If the settings cannot be changed (for example, without sufficient privileges), the program warns that connectivity may not be interrupted.
 
 ## How it works
 
 1. Check for root privileges or effective `CAP_NET_RAW`.
 2. Select the first eligible active, non-loopback IPv4 interface, excluding several common virtual-interface name prefixes.
 3. Read a default gateway from the Linux routing table and resolve its MAC address.
-4. Probe host addresses `.1` through `.254` in the gateway's assumed `/24`, excluding the local and gateway addresses.
-5. Record devices from received ARP replies and send forged replies in both directions between each device and the gateway, advertising the local MAC address.
-6. Repeat the sending cycle every 2 seconds and run background discovery after each 15-second scanner sleep.
-7. On Ctrl+C, attempt to send five corrective replies in each direction for each recorded device.
+4. Probe the interface's actual IPv4 subnet, computed from its prefix length (capped at `/22` for very large networks), excluding the network, broadcast, local, and gateway addresses.
+5. Prompt for an attack mode and, for the selected-targets and except-selected modes, let you pick one or more affected or protected devices. The picker keeps scanning in the background and refreshes the device list automatically; no manual rescan key is needed.
+6. Record devices from received ARP replies and send forged replies in both directions between each device and the gateway, advertising the local MAC address. The selected mode filters which devices are recorded and spoofed. IPv6 is handled with the same scope: the everyone mode sends a forged router advertisement plus neighbor advertisements to the whole link, while the targeted modes send unicast neighbor advertisements only to the affected devices (discovering their link-local addresses with a multicast echo request when needed).
+7. Repeat the sending cycle every 500 ms and run background discovery every 30 seconds. The selected-targets mode disables background discovery.
+8. On Ctrl+C, attempt to send five corrective replies in each direction for each recorded device.
 
-Timing constants are defined near the top of `src/main.rs`. The initial discovery wait is 2 seconds and the background discovery wait is 800 milliseconds.
+Timing constants are defined near the top of `src/main.rs`. The initial discovery wait is 6 seconds and the background discovery wait is 2 seconds.
 
 ## Limitations
 
-- **Broad scope:** every recorded device is included. There is no allowlist, single-target mode, or interactive confirmation.
-- **Fixed scan range:** discovery assumes the gateway's `/24`; it does not calculate the range from the interface's actual subnet mask.
+- **Scope depends on the mode:** the everyone mode includes every recorded device. The selected-targets and except-selected modes rely on the interactive device selection and on the selected MAC addresses, so devices that share, spoof, or change MAC addresses can be mis-scoped.
+- **IPv6 coverage depends on the mode:** the everyone mode advertises forged router and neighbor entries to the whole link, so IPv6 is affected for every host. The targeted modes send unicast neighbor advertisements only to the affected devices. That path needs each device's link-local IPv6 address; the program asks for it with a multicast echo request, so a device that never answers and whose address is never observed may keep IPv6 connectivity.
+- **Scan range cap:** discovery follows the interface's actual prefix length, but networks larger than a `/22` are scanned only within the `/22` that contains the local address.
 - **Multiple interfaces:** interface selection and default-route selection are independent. VPNs, multiple adapters, and complex routes can produce an incorrect pairing.
 - **Reply collection:** received ARP replies are not restricted to the probed range, and recorded devices are not expired from the target map.
-- **IPv4 only:** this does not implement IPv6 neighbor discovery manipulation.
 - **Environment dependent:** client isolation, ARP protections, static neighbor entries, and link-layer restrictions can prevent operation.
 - **Attempt counters:** packet counts measure send attempts, not confirmed delivery. Most send errors are ignored.
 - **Recovery is not guaranteed:** corrective replies may be rejected or lost. Crashes, forced termination, power loss, and some termination signals can bypass cleanup. The shutdown path does not confirm that remote ARP caches have recovered.
